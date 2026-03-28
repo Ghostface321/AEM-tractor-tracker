@@ -11,6 +11,17 @@ from bs4 import BeautifulSoup
 PAGE_URL = "https://www.aem.org/market-share-statistics/us-ag-tractor-and-combine-reports"
 OUTPUT_FILE = "data.xlsx"
 
+CATEGORY_ORDER = [
+    "2WD Farm Tractors",
+    "< 40 HP",
+    "40 < 100 HP",
+    "100+ HP",
+    "Total 2WD Farm Tractors",
+    "4WD Farm Tractors",
+    "Total Farm Tractors",
+    "Self-Prop Combines",
+]
+
 
 def get_latest_report_info():
     response = requests.get(PAGE_URL, timeout=30)
@@ -65,16 +76,7 @@ def parse_report(text: str, source_title: str, source_pdf_url: str) -> pd.DataFr
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    valid_categories = {
-        "2WD Farm Tractors",
-        "< 40 HP",
-        "40 < 100 HP",
-        "100+ HP",
-        "Total 2WD Farm Tractors",
-        "4WD Farm Tractors",
-        "Total Farm Tractors",
-        "Self-Prop Combines",
-    }
+    valid_categories = set(CATEGORY_ORDER)
 
     row_pattern = re.compile(
         r"^(?P<category>.+?)\s+"
@@ -122,19 +124,81 @@ def parse_report(text: str, source_title: str, source_pdf_url: str) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-def save_to_excel(df: pd.DataFrame):
+def prepare_combined_data(new_df: pd.DataFrame) -> pd.DataFrame:
     try:
-        existing = pd.read_excel(OUTPUT_FILE)
-
-        combined = pd.concat([existing, df], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["report_month", "category"], keep="last")
+        existing = pd.read_excel(OUTPUT_FILE, sheet_name="raw_data")
+        combined = pd.concat([existing, new_df], ignore_index=True)
     except FileNotFoundError:
-        combined = df.copy()
+        combined = new_df.copy()
+    except ValueError:
+        combined = new_df.copy()
     except Exception:
-        combined = df.copy()
+        combined = new_df.copy()
 
-    combined = combined.sort_values(["report_month", "category"]).reset_index(drop=True)
-    combined.to_excel(OUTPUT_FILE, index=False)
+    combined = combined.drop_duplicates(subset=["report_month", "category"], keep="last")
+
+    combined["report_month_date"] = pd.to_datetime(
+        combined["report_month"], format="%B %Y", errors="coerce"
+    )
+
+    category_rank = {category: i for i, category in enumerate(CATEGORY_ORDER)}
+    combined["category_rank"] = combined["category"].map(category_rank)
+
+    combined = combined.sort_values(
+        ["report_month_date", "category_rank"], ascending=[True, True]
+    ).reset_index(drop=True)
+
+    return combined
+
+
+def build_category_tables(combined: pd.DataFrame) -> pd.DataFrame:
+    frames = []
+
+    for category in CATEGORY_ORDER:
+        category_df = combined.loc[combined["category"] == category, [
+            "report_month",
+            "report_month_date",
+            "current_month_units",
+            "beginning_inventory",
+        ]].copy()
+
+        if category_df.empty:
+            continue
+
+        category_df = category_df.sort_values("report_month_date").reset_index(drop=True)
+        category_df = category_df.drop(columns=["report_month_date"])
+
+        header = pd.DataFrame([{
+            "report_month": category,
+            "current_month_units": None,
+            "beginning_inventory": None,
+        }])
+
+        spacer = pd.DataFrame([{
+            "report_month": None,
+            "current_month_units": None,
+            "beginning_inventory": None,
+        }])
+
+        frames.append(header)
+        frames.append(category_df)
+        frames.append(spacer)
+
+    if not frames:
+        return pd.DataFrame(columns=["report_month", "current_month_units", "beginning_inventory"])
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def save_to_excel(new_df: pd.DataFrame):
+    combined = prepare_combined_data(new_df)
+    category_tables = build_category_tables(combined)
+
+    raw_output = combined.drop(columns=["report_month_date", "category_rank"])
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        raw_output.to_excel(writer, sheet_name="raw_data", index=False)
+        category_tables.to_excel(writer, sheet_name="category_tables", index=False)
 
 
 def main():
@@ -145,7 +209,7 @@ def main():
     save_to_excel(df)
 
     print("Done.")
-    print(df)
+    print(df[["report_month", "category", "current_month_units", "beginning_inventory"]])
 
 
 if __name__ == "__main__":
