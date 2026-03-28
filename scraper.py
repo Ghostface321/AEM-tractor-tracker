@@ -199,6 +199,7 @@ def save_to_excel(new_df: pd.DataFrame):
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
         raw_output.to_excel(writer, sheet_name="raw_data", index=False)
         category_tables.to_excel(writer, sheet_name="category_tables", index=False)
+    raw_output.to_csv("data.csv", index=False)
 
 
 def main():
