@@ -1,0 +1,35 @@
+name: AEM tractor tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 6 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python scraper.py
+
+      - name: Commit updated Excel
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data.xlsx
+          git commit -m "Update data" || echo "No changes"
+          git push 
