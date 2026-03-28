@@ -1,7 +1,5 @@
-import os
 import re
 import io
-import json
 from datetime import datetime
 from urllib.parse import urljoin
 
@@ -9,52 +7,63 @@ import requests
 import pdfplumber
 import pandas as pd
 from bs4 import BeautifulSoup
-import gspread
-from gspread_dataframe import set_with_dataframe
-from google.oauth2.service_account import Credentials
 
 PAGE_URL = "https://www.aem.org/market-share-statistics/us-ag-tractor-and-combine-reports"
+OUTPUT_FILE = "data.xlsx"
+
 
 def get_latest_report_info():
-    r = requests.get(PAGE_URL, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    response = requests.get(PAGE_URL, timeout=30)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
 
     title_el = soup.find(["h3", "h4"], string=re.compile(r"Tractor and Combine Report", re.I))
     if not title_el:
-        raise RuntimeError("Report title not found.")
+        raise RuntimeError("Report title not found on the AEM page.")
 
     link_el = soup.find("a", string=re.compile(r"Download Report", re.I))
     if not link_el or not link_el.get("href"):
-        raise RuntimeError("Download link not found.")
+        raise RuntimeError("Download link not found on the AEM page.")
 
     title = title_el.get_text(" ", strip=True)
     pdf_url = urljoin(PAGE_URL, link_el["href"])
+
     return title, pdf_url
 
-def download_pdf(pdf_url: str) -> bytes:
-    r = requests.get(pdf_url, timeout=60)
-    r.raise_for_status()
-    return r.content
 
-def extract_text(pdf_bytes: bytes) -> str:
-    parts = []
+def download_pdf(pdf_url: str) -> bytes:
+    response = requests.get(pdf_url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    text_parts = []
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            parts.append(page.extract_text() or "")
-    return "\n".join(parts)
+            text_parts.append(page.extract_text() or "")
+
+    full_text = "\n".join(text_parts).strip()
+
+    if not full_text:
+        raise RuntimeError("No text could be extracted from the PDF.")
+
+    return full_text
+
 
 def parse_report(text: str, source_title: str, source_pdf_url: str) -> pd.DataFrame:
     month_match = re.search(
         r"AEM United States Ag Tractor and Combine Report\s+([A-Za-z]+\s+\d{4})",
-        text
+        text,
     )
     report_month = month_match.group(1) if month_match else None
 
     release_match = re.search(r"Report Released\s+(\d{1,2}/\d{1,2}/\d{4})", text)
     release_date = release_match.group(1) if release_match else None
 
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     valid_categories = {
         "2WD Farm Tractors",
@@ -67,7 +76,7 @@ def parse_report(text: str, source_title: str, source_pdf_url: str) -> pd.DataFr
         "Self-Prop Combines",
     }
 
-    pattern = re.compile(
+    row_pattern = re.compile(
         r"^(?P<category>.+?)\s+"
         r"(?P<current_month>[\d,]+)\s+"
         r"(?P<prior_year_month>[\d,]+)\s+"
@@ -79,76 +88,65 @@ def parse_report(text: str, source_title: str, source_pdf_url: str) -> pd.DataFr
     )
 
     rows = []
+
     for line in lines:
-        m = pattern.match(line)
-        if not m:
+        match = row_pattern.match(line)
+        if not match:
             continue
 
-        category = m.group("category").strip()
+        category = match.group("category").strip()
         if category not in valid_categories:
             continue
 
-        rows.append({
-            "report_month": report_month,
-            "release_date": release_date,
-            "category": category,
-            "current_month_units": int(m.group("current_month").replace(",", "")),
-            "prior_year_month_units": int(m.group("prior_year_month").replace(",", "")),
-            "month_pct_change": float(m.group("month_pct")),
-            "ytd_current_units": int(m.group("ytd_current").replace(",", "")),
-            "ytd_prior_units": int(m.group("ytd_prior").replace(",", "")),
-            "ytd_pct_change": float(m.group("ytd_pct")),
-            "beginning_inventory": int(m.group("inventory").replace(",", "")),
-            "source_title": source_title,
-            "source_pdf_url": source_pdf_url,
-            "scraped_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
-        })
+        rows.append(
+            {
+                "report_month": report_month,
+                "release_date": release_date,
+                "category": category,
+                "current_month_units": int(match.group("current_month").replace(",", "")),
+                "prior_year_month_units": int(match.group("prior_year_month").replace(",", "")),
+                "month_pct_change": float(match.group("month_pct")),
+                "ytd_current_units": int(match.group("ytd_current").replace(",", "")),
+                "ytd_prior_units": int(match.group("ytd_prior").replace(",", "")),
+                "ytd_pct_change": float(match.group("ytd_pct")),
+                "beginning_inventory": int(match.group("inventory").replace(",", "")),
+                "source_title": source_title,
+                "source_pdf_url": source_pdf_url,
+                "scraped_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+            }
+        )
 
     if not rows:
-        raise RuntimeError("No rows parsed from PDF.")
+        raise RuntimeError("No data rows could be parsed from the PDF.")
 
     return pd.DataFrame(rows)
 
-def get_gspread_client():
-    raw_json = os.environ["GCP_SERVICE_ACCOUNT_JSON"]
-    info = json.loads(raw_json)
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def write_to_google_sheets(df: pd.DataFrame):
-    sheet_name = os.environ["GOOGLE_SHEET_NAME"]
-    worksheet_name = os.environ.get("WORKSHEET_NAME", "data")
-
-    gc = get_gspread_client()
-    sh = gc.open(sheet_name)
-
+def save_to_excel(df: pd.DataFrame):
     try:
-        ws = sh.worksheet(worksheet_name)
-    except:
-        ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=30)
+        existing = pd.read_excel(OUTPUT_FILE)
 
-    existing = pd.DataFrame(ws.get_all_records())
-    if not existing.empty:
         combined = pd.concat([existing, df], ignore_index=True)
         combined = combined.drop_duplicates(subset=["report_month", "category"], keep="last")
-    else:
+    except FileNotFoundError:
+        combined = df.copy()
+    except Exception:
         combined = df.copy()
 
-    ws.clear()
-    set_with_dataframe(ws, combined.sort_values(["report_month", "category"]).reset_index(drop=True))
+    combined = combined.sort_values(["report_month", "category"]).reset_index(drop=True)
+    combined.to_excel(OUTPUT_FILE, index=False)
+
 
 def main():
-    title, pdf_url = get_latest_report_info()
+    source_title, pdf_url = get_latest_report_info()
     pdf_bytes = download_pdf(pdf_url)
-    text = extract_text(pdf_bytes)
-    df = parse_report(text, title, pdf_url)
-    write_to_google_sheets(df)
+    text = extract_text_from_pdf(pdf_bytes)
+    df = parse_report(text, source_title, pdf_url)
+    save_to_excel(df)
+
+    print("Done.")
     print(df)
+
 
 if __name__ == "__main__":
     main()
