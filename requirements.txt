@@ -2,6 +2,4 @@ requests
 beautifulsoup4
 pdfplumber
 pandas
-gspread
-gspread-dataframe
-google-auth
+openpyxl
